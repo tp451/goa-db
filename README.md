@@ -45,84 +45,109 @@ Step 8:  8_classify_occupations.py     Occupation & industry classification (HIS
 
 ```mermaid
 flowchart TD
-    classDef script fill:#4a90d9,color:#fff,stroke:#2c5f8a
-    classDef optional fill:#9aa5b1,color:#fff,stroke:#5a6877,stroke-dasharray:5 5
-    classDef data fill:#f5f5f5,stroke:#999,color:#333
+    classDef process fill:#4a90d9,color:#fff,stroke:#2c5f8a
     classDef model fill:#f0ad4e,color:#fff,stroke:#c68e3c
-    classDef service fill:#5cb85c,color:#fff,stroke:#3d8b3d
+    classDef tool fill:#5cb85c,color:#fff,stroke:#3d8b3d
+    classDef data fill:#f5f5f5,stroke:#999,color:#333
+    classDef optional fill:#9aa5b1,color:#fff,stroke:#5a6877,stroke-dasharray:5 5
 
-    %% Data stores
-    raw[(images_original/)]:::data
-    upscaled[(images_resize/<br/>only if step 0 was run)]:::data
-    rows_out[(detected_rows/)]:::data
-    ocr_out[(ocr_results/)]:::data
-    bios_out[(biographies_extracted_*.jsonl)]:::data
-    struct_out[(structured/<br/>11 JSONL tables)]:::data
-    disambig_out[(disambiguated/<br/>11 JSONL tables)]:::data
+    %% Input
+    scans[(Archival page scans)]:::data
 
-    %% Models
-    seg_model([seg model<br/>yolo_rows/]):::model
-    det_model([detect model<br/>yolo_headers/]):::model
+    subgraph prep [Image Preparation]
+        upscale["Image enhancement<br/>+ downscale to working resolution<br/><i>(optional preprocessing)</i>"]:::optional
+        esrgan{{RealESRGAN_x4plus}}:::optional -.-> upscale
+        clahe{{CLAHE}}:::optional -.-> upscale
 
-    %% External services
-    ocr_svc{{Ollama vision LLM<br/>(default; Google Cloud Vision optional)}}:::service
-    ollama_bio{{Ollama LLM}}:::service
-    ollama_struct{{Ollama LLM}}:::service
-    hf{{HuggingFace model}}:::service
-    geo{{GeoNames + MCGD<br/>+ GeoJSON}}:::service
-    namediv{{namedivider}}:::service
-    pykakasi{{pykakasi}}:::service
-    shapely{{Shapely}}:::service
+        seg_train[Instance segmentation training]:::process
+        yolo_seg{{YOLOe-v26x-seg}}:::tool -.-> seg_train
+        seg_train --> seg_model([Row segmentation model]):::model
 
-    %% Step 0 (optional)
-    raw -.-> s0[0_optional_upscale.py<br/>Step 0 OPTIONAL: upscale + resize]:::optional
-    s0 -.-> upscaled
+        det_train[Object detection training]:::process
+        yolo_det{{YOLOv26x}}:::tool -.-> det_train
+        det_train --> det_model([Header detection model]):::model
+    end
 
-    %% Step 1
-    raw --> s1[1_train_seg.py<br/>Step 1: train segmentation]:::script
-    s1 --> seg_model
+    subgraph recog [Recognition]
+        crop[Polygon-masked row cropping]:::process
+        segment[Header detection +<br/>row-to-header mapping]:::process
+        ocr[Character-level OCR]:::process
+        qwen_ocr{{Qwen 3.5 9B vision}}:::tool -.-> ocr
+        assign[Bounding-box overlap<br/>symbol-to-segment assignment]:::process
+        extract[Structured biography extraction<br/>+ deterministic era date conversion]:::process
+        qwen_extract{{Qwen 3.5 9B}}:::tool -.-> extract
+    end
 
-    %% Step 2
-    raw --> s2[2_detect_rows_cropper.py<br/>Step 2: crop rows]:::script
-    seg_model --> s2
-    s2 --> rows_out
+    subgraph struct [Structuring & Enrichment]
+        structure[Relational table construction<br/>with domain detection]:::process
+        geolocate[Geolocation matching +<br/>spatial province assignment]:::process
+        gender[Gender classification]:::process
+        namesplit[Name splitting]:::process
+        romanize[Name romanization]:::process
+        translate[Organisation, job title,<br/>and location name translation]:::process
+        plausibility[Plausibility checks]:::process
+        orgloc[Organisation location assignment]:::process
 
-    %% Step 3
-    s3[3_train_detect.py<br/>Step 3: train detection]:::script
-    s3 --> det_model
+        hf_gender{{gendec-DistilBERT}}:::tool -.->|Japanese| gender
+        qwen_gender{{Qwen 3.5 9B}}:::tool -.->|non-Japanese| gender
+        namediv{{namedivider}}:::tool -.-> namesplit
+        pykakasi{{pykakasi}}:::tool -.->|Japanese fast pass| romanize
+        qwen_roman{{Qwen 3.5 9B}}:::tool -.->|non-Japanese + fallback| romanize
+        qwen_trans{{Qwen 3.5 9B}}:::tool -.-> translate
+        geonames{{GeoNames + MCGD}}:::tool -.-> geolocate
+        geojson{{Historical GeoJSON<br/>boundaries}}:::tool -.-> geolocate
+    end
 
-    %% Step 4
-    raw -->|full-page images| s4[4_segment_recognise.py<br/>Step 4: segment + OCR]:::script
-    rows_out -->|row crops + metadata| s4
-    det_model --> s4
-    ocr_svc -.-> s4
-    s4 --> ocr_out
+    subgraph linkage [Linkage & Classification]
+        dedup[Cross-volume person deduplication<br/>by name + birth year]:::process
+        orgmatch[Organisation fuzzy matching<br/>Jaro-Winkler similarity]:::process
+        orgverify[Organisation match verification]:::process
+        qwen_org{{Qwen 3.5 9B}}:::tool -.-> orgverify
+        orghier[Organisation hierarchy detection]:::process
+        qwen_hier{{Qwen 3.5 9B}}:::tool -.-> orghier
+        hisco[HISCO occupation coding]:::process
+        qwen_hisco{{Qwen 3.5 9B}}:::tool -.-> hisco
+        isic[ISIC industry classification]:::process
+        qwen_isic{{Qwen 3.5 9B}}:::tool -.-> isic
+    end
 
-    %% Step 5
-    ocr_out --> s5[5_extract_biographies.py<br/>Step 5: extract biographies]:::script
-    ollama_bio -.-> s5
-    s5 --> bios_out
+    %% Cross-subgraph edges
+    scans -.->|optional path| upscale
+    scans --> seg_train
+    scans --> det_train
+    scans --> crop
+    upscale -.->|if enabled| crop
+    seg_model --> crop
+    scans -->|full-page images| segment
+    upscale -.-> segment
+    crop -->|cropped rows + coordinates| segment
+    det_model --> segment
+    segment --> ocr
+    ocr --> assign
+    assign --> extract
 
-    %% Step 6
-    bios_out --> s6[6_structure_biographies.py<br/>Step 6: structure + enrich]:::script
-    pykakasi -.->|romanize ja names| s6
-    ollama_struct -.->|romanize non-ja + translate<br/>+ gender (non-ja)| s6
-    hf -.->|gender classify (ja)| s6
-    geo -.->|geolocation| s6
-    shapely -.->|spatial join| s6
-    namediv -.->|name splitting| s6
-    s6 --> struct_out
+    extract --> structure
+    structure --> geolocate
+    geolocate --> gender
+    geolocate --> namesplit
+    gender --> romanize
+    namesplit --> romanize
+    romanize --> translate
+    translate --> plausibility
+    plausibility --> orgloc
+    orgloc --> enrich[Enriched relational tables]:::data
 
-    %% Step 7
-    struct_out --> s7[7_disambiguate.py<br/>Step 7: disambiguate]:::script
-    pykakasi -.->|re-romanize merged ja names| s7
-    ollama_struct -.->|org verification<br/>+ hierarchy| s7
-    geo -.->|place name filter| s7
-    s7 --> disambig_out
+    enrich --> dedup
+    enrich --> orgmatch
+    orgmatch -->|candidates| orgverify
+    orgverify -->|verified merges| orghier
+    dedup --> disambig[Disambiguated dataset]:::data
+    orghier --> disambig
 
-    %% Step 8
-    disambig_out --> s8[8_classify_occupations.py<br/>Step 8: classify occupations]:::script
-    ollama_bio -.->|HISCO + ISIC| s8
+    disambig --> hisco
+    disambig --> isic
+    hisco --> output[(Classified biographical dataset)]:::data
+    isic --> output
 ```
 
 > The dashed step 0 path is optional. With `USE_UPSCALED = False` (default in `config.py`), steps 2 and 4 read directly from `images_original/`. Setting `USE_UPSCALED = True` makes them read from `images_resize/` instead — only meaningful after step 0 has been run.
