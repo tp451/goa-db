@@ -1,0 +1,104 @@
+flowchart TD
+    classDef process fill:#4a90d9,color:#fff,stroke:#2c5f8a
+    classDef model fill:#f0ad4e,color:#fff,stroke:#c68e3c
+    classDef tool fill:#5cb85c,color:#fff,stroke:#3d8b3d
+    classDef data fill:#f5f5f5,stroke:#999,color:#333
+    classDef optional fill:#9aa5b1,color:#fff,stroke:#5a6877,stroke-dasharray:5 5
+
+    %% Input
+    scans[(Archival page scans)]:::data
+
+    subgraph prep [Image Preparation]
+        upscale["Image enhancement<br/>+ downscale to working resolution<br/><i>(optional preprocessing)</i>"]:::optional
+        esrgan{{RealESRGAN_x4plus}}:::optional -.-> upscale
+        clahe{{CLAHE}}:::optional -.-> upscale
+
+        seg_train[Instance segmentation training]:::process
+        yolo_seg{{YOLOe-v26x-seg}}:::tool -.-> seg_train
+        seg_train --> seg_model([Row segmentation model]):::model
+
+        det_train[Object detection training]:::process
+        yolo_det{{YOLOv26x}}:::tool -.-> det_train
+        det_train --> det_model([Header detection model]):::model
+    end
+
+    subgraph recog [Recognition]
+        crop[Polygon-masked row cropping]:::process
+        segment[Header detection +<br/>row-to-header mapping]:::process
+        ocr[Character-level OCR]:::process
+        qwen_ocr{{Qwen 3.5 9B vision}}:::tool -.-> ocr
+        assign[Bounding-box overlap<br/>symbol-to-segment assignment]:::process
+        extract[Structured biography extraction<br/>+ deterministic era date conversion]:::process
+        qwen_extract{{Qwen 3.5 9B}}:::tool -.-> extract
+    end
+
+    subgraph struct [Structuring & Enrichment]
+        structure[Relational table construction<br/>with domain detection]:::process
+        geolocate[Geolocation matching +<br/>spatial province assignment]:::process
+        gender[Gender classification]:::process
+        namesplit[Name splitting]:::process
+        romanize[Name romanization]:::process
+        translate[Organisation, job title,<br/>and location name translation]:::process
+        plausibility[Plausibility checks]:::process
+        orgloc[Organisation location assignment]:::process
+
+        hf_gender{{gendec-DistilBERT}}:::tool -.->|Japanese| gender
+        qwen_gender{{Qwen 3.5 9B}}:::tool -.->|non-Japanese| gender
+        namediv{{namedivider}}:::tool -.-> namesplit
+        pykakasi{{pykakasi}}:::tool -.->|Japanese fast pass| romanize
+        qwen_roman{{Qwen 3.5 9B}}:::tool -.->|non-Japanese + fallback| romanize
+        qwen_trans{{Qwen 3.5 9B}}:::tool -.-> translate
+        geonames{{GeoNames + MCGD}}:::tool -.-> geolocate
+        geojson{{Historical GeoJSON<br/>boundaries}}:::tool -.-> geolocate
+    end
+
+    subgraph linkage [Linkage & Classification]
+        dedup[Cross-volume person deduplication<br/>by name + birth year]:::process
+        orgmatch[Organisation fuzzy matching<br/>Jaro-Winkler similarity]:::process
+        orgverify[Organisation match verification]:::process
+        qwen_org{{Qwen 3.5 9B}}:::tool -.-> orgverify
+        orghier[Organisation hierarchy detection]:::process
+        qwen_hier{{Qwen 3.5 9B}}:::tool -.-> orghier
+        hisco[HISCO occupation coding]:::process
+        qwen_hisco{{Qwen 3.5 9B}}:::tool -.-> hisco
+        isic[ISIC industry classification]:::process
+        qwen_isic{{Qwen 3.5 9B}}:::tool -.-> isic
+    end
+
+    %% Cross-subgraph edges
+    scans -.->|optional path| upscale
+    scans --> seg_train
+    scans --> det_train
+    scans --> crop
+    upscale -.->|if enabled| crop
+    seg_model --> crop
+    scans -->|full-page images| segment
+    upscale -.-> segment
+    crop -->|cropped rows + coordinates| segment
+    det_model --> segment
+    segment --> ocr
+    ocr --> assign
+    assign --> extract
+
+    extract --> structure
+    structure --> geolocate
+    geolocate --> gender
+    geolocate --> namesplit
+    gender --> romanize
+    namesplit --> romanize
+    romanize --> translate
+    translate --> plausibility
+    plausibility --> orgloc
+    orgloc --> enrich[Enriched relational tables]:::data
+
+    enrich --> dedup
+    enrich --> orgmatch
+    orgmatch -->|candidates| orgverify
+    orgverify -->|verified merges| orghier
+    dedup --> disambig[Disambiguated dataset]:::data
+    orghier --> disambig
+
+    disambig --> hisco
+    disambig --> isic
+    hisco --> output[(Classified biographical dataset)]:::data
+    isic --> output

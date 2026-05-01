@@ -1,0 +1,54 @@
+# Core ML
+torch>=2.0.0
+torchvision>=0.15.0
+ultralytics>=8.0.0
+
+# Upscaling
+realesrgan>=0.3.0
+basicsr>=1.4.2
+
+# Image processing
+opencv-python>=4.8.0
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# OCR (optional alternative backend; only needed if OCR_BACKEND="google" in config.py)
+google-cloud-vision>=3.4.0
+
+# Visualization (training scripts)
+matplotlib>=3.7.0
+
+# LLM / API communication
+requests>=2.31.0
+
+# LLM output parsing
+json-repair>=0.30.0
+PyYAML>=6.0
+
+# Japanese name splitting & romanization
+namedivider-python>=0.2.0
+pykakasi>=2.2.0
+
+# NLP (biography structuring)
+transformers>=4.30.0
+
+# Geo (spatial province/country join in step 6)
+shapely>=2.0.0
+
+# ── Optional, only for compute_paper_stats.py ──────────────────────────────
+# Stats / paper output pipeline. Skip if you don't run compute_paper_stats.py.
+pandas>=2.0.0                # CSV/DataFrame I/O for OccCANINE comparison
+
+# BERTScore semantic similarity (compute_paper_stats.py --bertscore)
+# Default model is cl-tohoku/bert-base-japanese-v3, which uses MeCab via fugashi.
+bert_score>=0.3.13
+fugashi>=1.3.0
+unidic-lite>=1.0.8
+
+# OccCANINE / histocc HISCO classifier (compute_paper_stats.py --compare-hisco)
+# NOT on PyPI — install from GitHub:
+#   uv pip install "git+https://github.com/christianvedels/OccCANINE.git"
+# (Or git clone + pip install ./OccCANINE.) Also pulls in unidecode, sentencepiece.
+
+# Gemini extraction comparison (compute_paper_stats.py --run-cloud --cloud-provider google)
+# google-generativeai>=0.8.0
