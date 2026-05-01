@@ -109,6 +109,52 @@ def _data_path(data_dir, filename):
     return primary
 
 
+# ─── Shinjitai → Kyūjitai normalisation for strict comparison ──────────────
+# Models occasionally emit shinjitai (modern simplified Japanese: 国, 学, 区)
+# while gold annotations and other models use kyūjitai (historical: 國, 學, 區)
+# — or vice versa — even though the prompt asks for kyūjitai preservation.
+# Normalising both sides to kyūjitai before strict equality removes this
+# orthographic noise. Only includes 1:1 mappings (no ambiguous conversions
+# like 弁 ← 辨/瓣/辮).
+SHIN_TO_KY = {
+    "真":"眞","国":"國","区":"區","実":"實","学":"學","会":"會","広":"廣","芸":"藝",
+    "楽":"樂","沢":"澤","静":"靜","医":"醫","鉄":"鐵","台":"臺","辺":"邊","変":"變",
+    "寿":"壽","豊":"豐","応":"應","営":"營","検":"檢","駅":"驛","体":"體","続":"續",
+    "尽":"盡","当":"當","声":"聲","万":"萬","気":"氣","参":"參","与":"與","励":"勵",
+    "栄":"榮","団":"團","円":"圓","弥":"彌","稲":"稻","払":"拂","県":"縣","独":"獨",
+    "桜":"櫻","条":"條","抜":"拔","廃":"廢","闘":"鬪","歯":"齒","塩":"鹽","峰":"峯",
+    "竜":"龍","彦":"彥","壱":"壹","弐":"貳","継":"繼","聴":"聽","霊":"靈","顕":"顯",
+    "験":"驗","発":"發","仮":"假","雑":"雜","旧":"舊","即":"卽","挙":"擧","勲":"勳",
+    "鉱":"礦","産":"產","剤":"劑","随":"隨","蔵":"藏","号":"號","塁":"壘","双":"雙",
+    "両":"兩","売":"賣","読":"讀","対":"對","総":"總","奨":"獎","従":"從","駆":"驅",
+    "図":"圖","囲":"圍","検":"檢","機":"機","乱":"亂","糸":"絲","絵":"繪","姉":"姊",
+    "斎":"齋","斉":"齊","児":"兒","写":"寫","処":"處","渋":"澁","収":"收","粛":"肅",
+    "称":"稱","従":"從","証":"證","乗":"乘","状":"狀","畳":"疊","条":"條","嬢":"孃",
+    "壌":"壤","譲":"讓","醸":"釀","触":"觸","嘱":"囑","属":"屬","続":"續","堕":"墮",
+    "対":"對","帯":"帶","滞":"滯","台":"颱","沢":"澤","担":"擔","胆":"膽","団":"團",
+    "弾":"彈","遅":"遲","昼":"晝","虫":"蟲","鋳":"鑄","聴":"聽","懲":"懲","勅":"敕",
+    "鎮":"鎭","逓":"遞","鉄":"鐵","点":"點","伝":"傳","当":"當","党":"黨","盗":"盜",
+    "灯":"燈","闘":"鬪","徳":"德","独":"獨","読":"讀","届":"屆","縄":"繩","軟":"軟",
+    "弐":"貳","悩":"惱","脳":"腦","廃":"廢","売":"賣","麦":"麥","発":"發","髪":"髮",
+    "抜":"拔","繁":"繁","蛮":"蠻","卑":"卑","秘":"祕","浜":"濱","宝":"寶","豊":"豐",
+    "翻":"飜","毎":"毎","万":"萬","満":"滿","免":"免","訳":"譯","薬":"藥","与":"與",
+    "余":"餘","誉":"譽","揺":"搖","謡":"謠","様":"樣","羅":"羅","頼":"賴","乱":"亂",
+    "覧":"覽","欄":"欄","竜":"龍","虜":"虜","両":"兩","猟":"獵","糧":"糧","励":"勵",
+    "礼":"禮","炉":"爐","労":"勞","郎":"郞","録":"錄","湾":"灣",
+}
+
+
+def _normalize_chars(s):
+    """Apply shinjitai → kyūjitai map for fair strict comparison."""
+    if not isinstance(s, str):
+        return s
+    return s.translate(str.maketrans(SHIN_TO_KY))
+
+
+# Free-text scalar fields where partial (substring) match is meaningful.
+PARTIAL_SCALAR_FIELDS = {"name", "place", "origin_place", "rank", "religion"}
+
+
 # ─── BERTScore (lazy, opt-in) ───────────────────────────────────────────────
 # Used by score_extraction when --bertscore is passed. Adds semantic-similarity
 # F1 alongside the strict-equality scoring so the paper can report both rigorous
@@ -864,7 +910,16 @@ def _build_oid_to_volume(careers, pid_vol):
 
 def export_extraction_gold_sample(data_dir, bio_dir, out_dir, ocr_dir=None,
                                    n=50, seed=42):
-    """Gold 2 — extraction biographies.  Needs --bio-dir (+ --ocr-dir for body text)."""
+    """Gold 2 — extraction biographies. Needs --bio-dir.
+
+    Body for each sampled row is resolved at export time via
+    _resolve_body_for_row (header-matched, single-bio). The `slm_json`
+    column is left EMPTY here — populate it with a fresh Qwen run via
+    `--run-slm-alt --alt-model qwen3.5:9b --alt-column slm_json`. We
+    intentionally do not copy `extraction` from the bio JSONL because that
+    content was produced by step 5's stitched body, which differs from
+    the corrected single-bio body used by every other comparison column.
+    """
     print("\n=== Export: Extraction Gold Sample ===")
     if not bio_dir:
         print("  Skipped (need --bio-dir)")
@@ -879,34 +934,38 @@ def export_extraction_gold_sample(data_dir, bio_dir, out_dir, ocr_dir=None,
     all_bios = []
     for bf in bio_files:
         for rec in load_jsonl(bf):
-            body = rec.get("body_text", "") or ""
             all_bios.append({
                 "entry_index": rec.get("entry_index"),
                 "source_page": rec.get("source_page", ""),
                 "source_image": rec.get("source_image", ""),
                 "header": rec.get("header_ocr", ""),
-                "body": body,
-                "body_len": len(body),
-                "slm_json": json.dumps(rec.get("extraction", {}), ensure_ascii=False),
+                # body + slm_json filled below
+                "body": "",
+                "body_len": 0,
             })
 
-    # Try to fill missing body text from OCR segment files
-    if ocr_dir and os.path.isdir(ocr_dir):
+    # Resolve body via header-matched single-bio lookup (same path used by
+    # _resolve_body_for_row). Builds the bio image index + OCR root list once.
+    bio_idx = _build_bio_image_index(Path(__file__).parent)
+    next_bio_idx = _build_next_bio_index(Path(__file__).parent)
+    ocr_roots = _detect_ocr_roots(Path(__file__).parent, primary=ocr_dir)
+    if ocr_roots:
+        print(f"  resolving body from OCR roots:")
+        for r in ocr_roots:
+            print(f"    {r}")
         for bio in all_bios:
-            if bio["body"] or not bio["source_page"] or not bio["source_image"]:
-                continue
-            row_name = bio["source_image"].replace(".jpg", "").replace(".png", "")
-            seg_path = os.path.join(ocr_dir, bio["source_page"],
-                                    f"{row_name}_segmented_output.json")
-            if os.path.exists(seg_path):
-                try:
-                    with open(seg_path, encoding="utf-8") as fh:
-                        segs = json.load(fh)
-                    bio["body"] = "\n".join(
-                        s.get("body_text", "") for s in segs if s.get("body_text"))
-                    bio["body_len"] = len(bio["body"])
-                except Exception:
-                    pass
+            row_like = {
+                "source_page": bio["source_page"],
+                "entry_index": bio["entry_index"],
+                "header": bio["header"],
+                "body": "",
+            }
+            body = _resolve_body_for_row(row_like, ocr_roots, bio_idx, next_bio_idx)
+            if body:
+                bio["body"] = body
+                bio["body_len"] = len(body)
+    else:
+        print("  no OCR roots found; bodies left empty")
 
     if not all_bios:
         print("  No biographies found")
@@ -918,7 +977,7 @@ def export_extraction_gold_sample(data_dir, bio_dir, out_dir, ocr_dir=None,
     save_csv(os.path.join(out_dir, "gold_samples", "extraction_gold_sample.csv"),
              [{"entry_index": r["entry_index"], "source_page": r["source_page"],
                "header": r["header"], "body": r["body"],
-               "slm_json": r["slm_json"], "cloud_json": "", "gold_json": ""}
+               "slm_json": "", "cloud_json": "", "gold_json": ""}
               for r in sample])
 
 
@@ -1049,20 +1108,27 @@ NOTE: OCR evaluation is handled by a separate, more comprehensive script —
       ISIC, organisation matching, and organisation hierarchy.
 
 
-1. extraction_gold_sample.csv  (if exported with --bio-dir)
+1. extraction_gold_sample.csv  (exported with --bio-dir)
    ---------------------------------------------------------
    Columns:  entry_index | source_page | header | body |
              slm_json | cloud_json | gold_json
+             (and any other *_json columns from --run-slm-alt / --run-hf)
 
-   - Read the `header` (person's name) and `body` (the raw biography text).
-   - Check `slm_json`: correct any wrong fields and save the result as
-     `gold_json` (valid JSON, same schema as slm_json).
+   - `body` is populated at export time via header-matched single-bio
+     resolution from the OCR segment files (no orphan stitching).
+   - `slm_json` starts EMPTY. Populate it with a fresh Qwen run on the
+     same body (so it's directly comparable to cloud_json/ministral_json/
+     llama_json):
+         python compute_paper_stats.py --run-slm-alt --alt-model qwen3.5:9b
+                                       --alt-column slm_json
+   - Read the `header` and `body` to write your `gold_json` annotation.
    - Schema fields: name, birth_year, birth_year_raw, place, phone_number,
      origin_place, rank, religion, hobbies[], education[], career[],
      family_member[].
    - Career entries: {job_title, organization, start_year, start_year_raw,
      place_name, current}.
-   - Tip: copy slm_json into gold_json, then fix only the errors.
+   - Tip: after running --run-slm-alt for slm_json, copy slm_json into
+     gold_json, then fix only the errors.
    - `cloud_json` is filled by --run-cloud or you can paste Gemini results.
 
 2. hisco_gold_sample.csv
@@ -1244,15 +1310,49 @@ def score_extraction(out_dir, use_bert=False):
             return str(item or "")
         return " | ".join(str(item.get(f) or "") for f in sub_fields)
 
-    def _coerce_to_dict(obj):
+    def _coerce_to_dict(obj, target_name=None):
         """Some models wrap their output as [{...}] or {"data": {...}}.
-        Try to pull a single dict out so scoring can proceed."""
+        Try to pull a single dict out so scoring can proceed.
+
+        When *target_name* is given (typically the row's `header`), we use it
+        to pick the matching bio out of a multi-bio list — Gemini sometimes
+        extracts every bio on the OCR page, not just the requested one."""
         if isinstance(obj, dict):
             return obj
         if isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, dict):
-                    return item
+            dicts = [x for x in obj if isinstance(x, dict)]
+            if not dicts:
+                return None
+            if target_name:
+                tgt = "".join(str(target_name).split())  # strip whitespace
+                # 1. Exact name match
+                for d in dicts:
+                    nm = "".join(str(d.get("name") or "").split())
+                    if nm and nm == tgt:
+                        return d
+                # 2. Substring either way (handles slight OCR variations)
+                for d in dicts:
+                    nm = "".join(str(d.get("name") or "").split())
+                    if nm and (nm in tgt or tgt in nm):
+                        return d
+                # 3. Highest-similarity fuzzy match (kyūjitai/shinjitai
+                #    variants like 豐/豊 or OCR slips like 熹/熾). Threshold
+                #    0.5 keeps us from picking a totally unrelated person
+                #    when the target name simply isn't in the list at all.
+                from difflib import SequenceMatcher
+                best_ratio = 0.0
+                best_dict = None
+                for d in dicts:
+                    nm = "".join(str(d.get("name") or "").split())
+                    if not nm:
+                        continue
+                    ratio = SequenceMatcher(None, tgt, nm).ratio()
+                    if ratio > best_ratio:
+                        best_ratio = ratio
+                        best_dict = d
+                if best_ratio >= 0.5 and best_dict is not None:
+                    return best_dict
+            return dicts[0]
         return None
 
     def _lenient_json_parse(s):
@@ -1293,25 +1393,39 @@ def score_extraction(out_dir, use_bert=False):
             return candidate
         raise json.JSONDecodeError("Could not lenient-parse", s, 0)
 
-    def _strict_score_pair(pred_str, gold_str):
-        """Strict per-field accuracy + parsed JSON dicts (None on parse error
-        or when the JSON parses to a non-object/non-recoverable shape)."""
-        fc, ft = defaultdict(int), defaultdict(int)
+    def _strict_score_pair(pred_str, gold_str, target_name=None):
+        """Per-field scoring. Returns (strict_correct, total, partial_correct,
+        list_item_match, pred_dict, gold_dict).
+        - 'strict' = exact equality after kyūjitai normalisation.
+        - 'partial' = strict OR substring match either way (free-text scalars).
+        - list_item_match[field] = (pred_matched, gold_matched, n_pred, n_gold)
+          for content-level partial matching on LIST fields, accumulated
+          across the bio."""
+        fc, ft, fp = defaultdict(int), defaultdict(int), defaultdict(int)
+        lim = defaultdict(lambda: [0, 0, 0, 0])  # pred_match, gold_match, n_pred, n_gold
         try:
             pred_raw = _lenient_json_parse(pred_str) if isinstance(pred_str, str) else pred_str
             gold_raw = _lenient_json_parse(gold_str) if isinstance(gold_str, str) else gold_str
         except (json.JSONDecodeError, TypeError):
-            return fc, ft, None, None
-        pred = _coerce_to_dict(pred_raw)
-        gold = _coerce_to_dict(gold_raw)
+            return fc, ft, fp, lim, None, None
+        pred = _coerce_to_dict(pred_raw, target_name=target_name)
+        gold = _coerce_to_dict(gold_raw, target_name=target_name)
         if pred is None or gold is None:
-            return fc, ft, None, None
+            return fc, ft, fp, lim, None, None
         for f in SCALAR:
             gv, pv = gold.get(f), pred.get(f)
             if gv is not None or pv is not None:
                 ft[f] += 1
-                if str(gv) == str(pv):
+                # Normalise both sides to kyūjitai before comparing so that
+                # 国 vs 國 etc. don't count as mismatches.
+                sg = _normalize_chars(str(gv) if gv is not None else "")
+                sp = _normalize_chars(str(pv) if pv is not None else "")
+                if sg == sp:
                     fc[f] += 1
+                    fp[f] += 1
+                elif f in PARTIAL_SCALAR_FIELDS and sg and sp and (
+                        sg in sp or sp in sg):
+                    fp[f] += 1
         for f in LIST:
             gl = gold.get(f) or []
             pl = pred.get(f) or []
@@ -1323,7 +1437,24 @@ def score_extraction(out_dir, use_bert=False):
                 ft[f"{f}_count"] += 1
                 if len(gl) == len(pl):
                     fc[f"{f}_count"] += 1
-        return fc, ft, pred, gold
+                    fp[f"{f}_count"] += 1
+                # Item-level partial match (kyūjitai-normalised substring).
+                # An item "matches" if its concatenated sub-field string is
+                # a substring of, or contains, any item on the other side.
+                sub = LIST_FIELDS[f]
+                ps = [_normalize_chars(_item_to_str(p, sub)) for p in pl]
+                gs = [_normalize_chars(_item_to_str(g, sub)) for g in gl]
+                ps = [s for s in ps if s.strip()]
+                gs = [s for s in gs if s.strip()]
+                p_match = sum(1 for x in ps if any(
+                    x == y or x in y or y in x for y in gs))
+                g_match = sum(1 for y in gs if any(
+                    x == y or x in y or y in x for x in ps))
+                lim[f][0] += p_match
+                lim[f][1] += g_match
+                lim[f][2] += len(ps)
+                lim[f][3] += len(gs)
+        return fc, ft, fp, lim, pred, gold
 
     # Source columns: "slm" (Qwen baseline) is always first. Any other column
     # ending in _json is auto-discovered so a later --run-slm-alt / --run-hf /
@@ -1341,18 +1472,25 @@ def score_extraction(out_dir, use_bert=False):
         if rows_for_col:
             sources.append((label, col, rows_for_col))
 
-    # ── Pass 1: strict accuracy + (if use_bert) collect string pairs ──
-    strict_totals = {src: (defaultdict(int), defaultdict(int)) for src, _, _ in sources}
+    # ── Pass 1: strict + partial accuracy + (if use_bert) collect string pairs ──
+    strict_totals = {src: (defaultdict(int), defaultdict(int), defaultdict(int),
+                           defaultdict(lambda: [0, 0, 0, 0]))
+                     for src, _, _ in sources}
     bert_pairs = []     # [{src,row,field,kind,p_idx,g_idx,cand,ref}, ...]
     bert_meta  = []     # [{src,row,field,n_p,n_g}] — captures rows even if one side empty
     for src_label, json_field, rows in sources:
-        c_acc, t_acc = strict_totals[src_label]
+        c_acc, t_acc, p_acc, lim_acc = strict_totals[src_label]
         for ri, r in enumerate(rows):
             pred_str = r.get(json_field, "{}")
             gold_str = r["gold_json"]
-            c, t, pred, gold = _strict_score_pair(pred_str, gold_str)
+            c, t, p, lim, pred, gold = _strict_score_pair(
+                pred_str, gold_str, target_name=r.get("header"))
             for k in t:
-                c_acc[k] += c[k]; t_acc[k] += t[k]
+                c_acc[k] += c[k]; t_acc[k] += t[k]; p_acc[k] += p[k]
+            for f, vals in lim.items():
+                acc = lim_acc[f]
+                acc[0] += vals[0]; acc[1] += vals[1]
+                acc[2] += vals[2]; acc[3] += vals[3]
             if not (use_bert and pred is not None and gold is not None):
                 continue
             for f in SCALAR_TEXT:
@@ -1461,14 +1599,19 @@ def score_extraction(out_dir, use_bert=False):
         lines.append(f"BERTScore: model={_BERT_MODEL_NAME}, match-threshold F1≥{BERT_F1_MATCH}\n")
     pf_rows = []
     for src_label, _, rows in sources:
-        c_acc, t_acc = strict_totals[src_label]
+        c_acc, t_acc, p_acc, lim_acc = strict_totals[src_label]
         n = len(rows)
         lines.append(f"\n{src_label.upper()} per-field accuracy ({n} bios):")
         for f in SCALAR:
-            t = t_acc.get(f, 0); c = c_acc.get(f, 0)
+            t = t_acc.get(f, 0); c = c_acc.get(f, 0); p = p_acc.get(f, 0)
             acc = _pct(c, t) if t else "N/A"
             row = {"field": f, "correct": c, "total": t,
-                   "accuracy": acc, "source": src_label}
+                   "accuracy": acc, "source": src_label,
+                   "correct_partial": p,
+                   "accuracy_partial": _pct(p, t) if t else "N/A"}
+            partial_str = ""
+            if t and f in PARTIAL_SCALAR_FIELDS and p > c:
+                partial_str = f"  partial: {_pct(p, t)} ({p}/{t})"
             extra = ""
             if use_bert and f in SCALAR_TEXT:
                 bs = _bert_scalar(src_label, f)
@@ -1479,7 +1622,7 @@ def score_extraction(out_dir, use_bert=False):
                     extra = (f"  [BERT F1={bs['bert_f1_mean']}, "
                              f"match≥{BERT_F1_MATCH}: {bs['bert_match_rate']}"
                              f"{cond}]")
-            lines.append(f"  {f}: {acc} ({c}/{t}){extra}")
+            lines.append(f"  {f}: {acc} ({c}/{t}){partial_str}{extra}")
             pf_rows.append(row)
         for f in LIST:
             count_key = f"{f}_count"
@@ -1488,6 +1631,26 @@ def score_extraction(out_dir, use_bert=False):
             pf_rows.append({"field": count_key, "correct": c, "total": t,
                             "accuracy": acc, "source": src_label})
             lines.append(f"  {count_key}: {acc} ({c}/{t})")
+            # Item-level partial-match rates (substring, kyūjitai-normalised).
+            #   pred-side = "of items I predicted, what % found a substring
+            #                match in gold"  (precision-style)
+            #   gold-side = "of gold items, what % were recovered by some
+            #                pred"            (recall-style)
+            lim = lim_acc.get(f)
+            if lim and (lim[2] or lim[3]):
+                pm, gm, np, ng = lim
+                p_rate = _pct(pm, np) if np else "N/A"
+                g_rate = _pct(gm, ng) if ng else "N/A"
+                pf_rows.append({"field": f"{f}_items_partial", "source": src_label,
+                                "accuracy": "N/A", "correct": "", "total": "",
+                                "items_pred_match": pm, "items_pred_total": np,
+                                "items_pred_rate": p_rate,
+                                "items_gold_match": gm, "items_gold_total": ng,
+                                "items_gold_rate": g_rate})
+                lines.append(
+                    f"        items partial: pred {p_rate} ({pm}/{np}), "
+                    f"gold {g_rate} ({gm}/{ng})"
+                )
             if use_bert:
                 bs = _bert_list(src_label, f)
                 if bs:
@@ -1736,12 +1899,12 @@ def _cloud_extract(client, prov, model, header, body, create_prompt_fn):
             model=model, temperature=0, max_tokens=3500,
             messages=[{"role": "system", "content": sys_msg},
                       {"role": "user", "content": usr_msg}])
-        return r.choices[0].message.content.strip()
+        return _clean_llm_json_output(r.choices[0].message.content)
     if prov == "anthropic":
         r = client.messages.create(
             model=model, max_tokens=3500, temperature=0, system=sys_msg,
             messages=[{"role": "user", "content": usr_msg}])
-        return r.content[0].text.strip()
+        return _clean_llm_json_output(r.content[0].text)
     if prov == "google":
         genai = client.get("genai") if isinstance(client, dict) else None
         if not genai:
@@ -1773,7 +1936,60 @@ def _cloud_extract(client, prov, model, header, body, create_prompt_fn):
                        4: "RECITATION", 5: "OTHER"}.get(int(fr) if fr else 0,
                                                         f"finish_reason={fr}")
             raise RuntimeError(f"Gemini produced no text ({fr_name})")
-        return text
+        return _clean_llm_json_output(text)
+
+
+def _clean_llm_json_output(raw):
+    """Best-effort: turn an LLM's raw response into a clean, single-line JSON
+    string. Used by _cloud_extract / _ollama_extract / run_hf_extraction so
+    every CSV cell stores parseable JSON whenever possible — preventing the
+    markdown-fence + flatten breakage we hit before.
+
+    Stages:
+      1. json.loads → re-serialize compact (already-clean output).
+      2. Strip ```json ... ``` markdown fences → retry.
+      3. Find the last balanced {...} block → retry.
+      4. Give up: return the original string (caller stores it raw, scoring
+         will still try _lenient_json_parse later)."""
+    if not isinstance(raw, str):
+        return raw
+    s = raw.strip()
+    if not s:
+        return s
+    # 1
+    try:
+        return json.dumps(json.loads(s), ensure_ascii=False,
+                          separators=(", ", ": "))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # 2
+    import re
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", s)
+    if m:
+        try:
+            return json.dumps(json.loads(m.group(1)), ensure_ascii=False,
+                              separators=(", ", ": "))
+        except json.JSONDecodeError:
+            pass
+    # 3 — last balanced {...}
+    depth = 0
+    start = -1
+    last = None
+    for i, ch in enumerate(s):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start >= 0:
+                try:
+                    last = json.loads(s[start:i + 1])
+                except json.JSONDecodeError:
+                    pass
+    if last is not None:
+        return json.dumps(last, ensure_ascii=False, separators=(", ", ": "))
+    return s
 
 
 def _is_dummy_extraction(s):
@@ -1813,6 +2029,37 @@ def _build_bio_image_index(project_root):
                               rec.get("source_image"))
                 if sp is not None and ei is not None and si:
                     out[(sp, ei)] = si
+    return out
+
+
+def _build_next_bio_index(project_root):
+    """(source_page, entry_index_int) → (next_source_page, next_source_image)
+    in step-5 stream order. Used by _resolve_body_for_row to walk forward
+    and append leading orphan segments from the next bio's row-crop file —
+    replicating 5_extract_biographies.stream_stitched_entries' behaviour
+    of attaching orphan continuations to the bio that started just before."""
+    import glob
+    out = {}
+    for bf in sorted(glob.glob(str(Path(project_root) / "biographies_extracted_*.jsonl"))):
+        entries = []
+        with open(bf, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sp = rec.get("source_page")
+                ei = rec.get("entry_index")
+                si = rec.get("source_image")
+                if sp is None or ei is None or not si:
+                    continue
+                entries.append((sp, ei, si))
+        entries.sort(key=lambda x: x[1])  # by entry_index (step 5 yield order)
+        for i, (sp, ei, _) in enumerate(entries[:-1]):
+            nxt = entries[i + 1]
+            out[(sp, ei)] = (nxt[0], nxt[2])
     return out
 
 
@@ -1857,13 +2104,24 @@ def _detect_ocr_roots(project_root, primary=None):
     return roots
 
 
-def _resolve_body_for_row(row, ocr_roots, bio_image_index):
-    """Return body text for a gold row. Prefers row['body'] if non-empty;
-    otherwise walks the candidate ocr_results roots looking for
-    <root>/<source_page>/<source_image>_segmented_output.json and uses
-    the first hit. Returns "" if no body can be recovered.
+def _resolve_body_for_row(row, ocr_roots, bio_image_index, next_bio_index=None):
+    """Return body text for a gold row, replicating step 5's stitcher
+    behaviour. Prefers row['body'] if non-empty; otherwise:
 
-    *ocr_roots* may be a string (single dir) or a list (try each in order)."""
+      1. Find the row's `type='standard'` segment in its own row-crop file,
+         matched by `header_ocr` against row['header'] (with fuzzy fallback).
+      2. If the row's standard is the LAST standard in its own file, walk
+         forward through subsequent row-crop files (in step-5 order, looked
+         up via *next_bio_index*) and append each file's leading orphan
+         segments. Stop at the first 'standard' encountered. This recovers
+         continuation content that flowed across row crops — which is what
+         step 5 actually fed to Qwen for long bios like 永田良介.
+      3. If the row's standard is followed by other standards in the same
+         file, no orphans are appended (the next standard ends accumulation).
+
+    *ocr_roots* may be a string or a list. *next_bio_index* is optional;
+    omitting it disables orphan stitching (keeps single-bio behaviour).
+    """
     body = (row.get("body") or "").strip()
     if body:
         return body
@@ -1879,20 +2137,131 @@ def _resolve_body_for_row(row, ocr_roots, bio_image_index):
         return ""
     stem = src_image.rsplit(".", 1)[0]
     candidates = [ocr_roots] if isinstance(ocr_roots, str) else list(ocr_roots)
-    for root in candidates:
-        seg_path = Path(root) / sp / f"{stem}_segmented_output.json"
-        if not seg_path.exists():
-            continue
+    target = "".join(str(row.get("header") or "").split())
+
+    def _norm(s):
+        return "".join(str(s or "").split())
+
+    def _read_segs(path):
         try:
-            with open(seg_path, encoding="utf-8") as f:
-                segs = json.load(f)
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
         except (json.JSONDecodeError, OSError):
-            continue
-        body_parts = [s.get("body_text", "") for s in segs if s.get("body_text")]
-        text = "\n".join(body_parts).strip()
-        if text:
-            return text
-    return ""
+            return None
+
+    def _find_seg_path(page, image_stem):
+        """Return the first existing seg-file path across candidate roots."""
+        fname = f"{image_stem}_segmented_output.json"
+        for root in candidates:
+            p = Path(root) / page / fname
+            if p.exists():
+                return p
+        return None
+
+    seg_path = _find_seg_path(sp, stem)
+    if not seg_path:
+        return ""
+    segs = _read_segs(seg_path)
+    if segs is None:
+        return ""
+
+    std_segs = [s for s in segs
+                if s.get("type") == "standard"
+                and (s.get("body_text") or "").strip()]
+    if not std_segs:
+        for s in segs:
+            t = (s.get("body_text") or "").strip()
+            if t:
+                return t
+        return ""
+
+    # 1. Find target's standard segment by header match
+    target_idx = None
+    if target:
+        for i, s in enumerate(std_segs):
+            if _norm(s.get("header_ocr")) == target:
+                target_idx = i
+                break
+        if target_idx is None:
+            for i, s in enumerate(std_segs):
+                hdr = _norm(s.get("header_ocr"))
+                if hdr and (hdr in target or target in hdr):
+                    target_idx = i
+                    break
+        if target_idx is None:
+            from difflib import SequenceMatcher
+            best_ratio = 0.0
+            best_idx = None
+            for i, s in enumerate(std_segs):
+                hdr = _norm(s.get("header_ocr"))
+                if not hdr:
+                    continue
+                ratio = SequenceMatcher(None, target, hdr).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_idx = i
+            if best_ratio >= 0.5:
+                target_idx = best_idx
+    if target_idx is None:
+        target_idx = 0
+
+    body_parts = [std_segs[target_idx]["body_text"].strip()]
+
+    # 2. If target is NOT the last standard in this file, the next standard
+    # in the same file ends the bio — no orphans to append.
+    if target_idx < len(std_segs) - 1:
+        return body_parts[0]
+
+    # 3. Target IS the last standard. Walk forward to the next bio's file
+    # (via next_bio_index) and append leading orphans there. Repeat through
+    # consecutive all-orphan files in the rare case that orphan content
+    # spans multiple row crops.
+    if next_bio_index is None:
+        return body_parts[0]
+
+    visited = set()
+    cur_sp, cur_ei = sp, ei
+    while True:
+        nxt = next_bio_index.get((cur_sp, cur_ei))
+        if not nxt:
+            break
+        next_sp, next_si = nxt
+        next_stem = next_si.rsplit(".", 1)[0]
+        if (next_sp, next_stem) in visited:
+            break
+        visited.add((next_sp, next_stem))
+        next_path = _find_seg_path(next_sp, next_stem)
+        if not next_path:
+            break
+        next_segs = _read_segs(next_path)
+        if next_segs is None:
+            break
+        # Take leading orphans, stop at first 'standard'.
+        added_any = False
+        hit_standard = False
+        for s in next_segs:
+            if s.get("type") == "standard":
+                hit_standard = True
+                break
+            bt = (s.get("body_text") or "").strip()
+            if bt:
+                body_parts.append(bt)
+                added_any = True
+        if hit_standard or not added_any:
+            break
+        # File had orphans only — continue to the file after it.
+        # We need the entry_index of the bio that "owns" the next file.
+        # Use the bio_image_index in reverse: find entry_index for next_sp/next_si.
+        next_ei = None
+        for (ksp, kei), ksi in bio_image_index.items():
+            if ksp == next_sp and ksi == next_si:
+                next_ei = kei
+                break
+        if next_ei is None:
+            break
+        cur_sp, cur_ei = next_sp, next_ei
+
+    return "\n".join(body_parts).strip()
 
 
 def run_cloud_extraction(out_dir, provider, model, ocr_dir=None):
@@ -1910,6 +2279,7 @@ def run_cloud_extraction(out_dir, provider, model, ocr_dir=None):
     else:
         print("  Warning: using fallback prompt (create_prompt not found)")
     bio_idx = _build_bio_image_index(Path(__file__).parent)
+    next_bio_idx = _build_next_bio_index(Path(__file__).parent)
     ocr_roots = _detect_ocr_roots(Path(__file__).parent, primary=ocr_dir)
     print(f"  body fallback: {len(bio_idx)} bio entries indexed; OCR roots:")
     for r in ocr_roots:
@@ -1922,7 +2292,7 @@ def run_cloud_extraction(out_dir, provider, model, ocr_dir=None):
             print(f"  [skip {i+1}/{len(data)}] cloud_json already filled")
             continue
         header = row.get("header", "")
-        body = _resolve_body_for_row(row, ocr_roots, bio_idx)
+        body = _resolve_body_for_row(row, ocr_roots, bio_idx, next_bio_idx)
         if not body:
             n_no_body += 1
             print(f"  [skip {i+1}/{len(data)}] no body "
@@ -1966,7 +2336,7 @@ def _ollama_extract(model, header, body, create_prompt_fn, base_url, max_tokens)
         "options": {"temperature": 0.0, "num_predict": max_tokens},
     }, timeout=300)
     r.raise_for_status()
-    return r.json()["message"]["content"].strip()
+    return _clean_llm_json_output(r.json()["message"]["content"])
 
 
 def run_slm_alt_extraction(out_dir, model, column, ocr_dir=None):
@@ -1997,6 +2367,7 @@ def run_slm_alt_extraction(out_dir, model, column, ocr_dir=None):
         for row in data:
             row.setdefault(column, "")
     bio_idx = _build_bio_image_index(Path(__file__).parent)
+    next_bio_idx = _build_next_bio_index(Path(__file__).parent)
     ocr_roots = _detect_ocr_roots(Path(__file__).parent, primary=ocr_dir)
     print(f"  body fallback: {len(bio_idx)} bio entries indexed; OCR roots:")
     for r in ocr_roots:
@@ -2009,7 +2380,7 @@ def run_slm_alt_extraction(out_dir, model, column, ocr_dir=None):
             print(f"  [skip {i+1}/{len(data)}] {column} already filled")
             continue
         header = row.get("header", "")
-        body = _resolve_body_for_row(row, ocr_roots, bio_idx)
+        body = _resolve_body_for_row(row, ocr_roots, bio_idx, next_bio_idx)
         if not body:
             n_no_body += 1
             print(f"  [skip {i+1}/{len(data)}] no body "
@@ -2064,6 +2435,7 @@ def run_hf_extraction(out_dir, model, column, token, ocr_dir=None):
         for row in data:
             row.setdefault(column, "")
     bio_idx = _build_bio_image_index(Path(__file__).parent)
+    next_bio_idx = _build_next_bio_index(Path(__file__).parent)
     ocr_roots = _detect_ocr_roots(Path(__file__).parent, primary=ocr_dir)
     print(f"  body fallback: {len(bio_idx)} bio entries indexed; OCR roots:")
     for r in ocr_roots:
@@ -2076,7 +2448,7 @@ def run_hf_extraction(out_dir, model, column, token, ocr_dir=None):
             print(f"  [skip {i+1}/{len(data)}] {column} already filled")
             continue
         header = row.get("header", "")
-        body = _resolve_body_for_row(row, ocr_roots, bio_idx)
+        body = _resolve_body_for_row(row, ocr_roots, bio_idx, next_bio_idx)
         if not body:
             n_no_body += 1
             print(f"  [skip {i+1}/{len(data)}] no body "
@@ -2096,10 +2468,7 @@ def run_hf_extraction(out_dir, model, column, token, ocr_dir=None):
                 max_tokens=3500, temperature=0,
             )
             raw = resp.choices[0].message.content.strip()
-            try:
-                row[column] = json.dumps(json.loads(raw), ensure_ascii=False)
-            except json.JSONDecodeError:
-                row[column] = raw
+            row[column] = _clean_llm_json_output(raw)
             n_ran += 1
         except Exception as e:
             n_err += 1
